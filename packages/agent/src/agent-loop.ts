@@ -161,16 +161,19 @@ async function runLoop(
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
+	// pendingMessages 有两个来源: Steering 消息 和 FollowUp 消息
+
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
-		let hasMoreToolCalls = true;
+		let hasMoreToolCalls = true; // 初始值为true，确保下面的while循环至少运行一次
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
 			if (!firstTurn) {
+				// 为什么第一轮不发送? 因为在调用 runLoop() 前已经发送了 agent_start 和 turn_start 事件
 				await emit({ type: "turn_start" });
 			} else {
 				firstTurn = false;
@@ -179,10 +182,11 @@ async function runLoop(
 			// Process pending messages (inject before next assistant response)
 			if (pendingMessages.length > 0) {
 				for (const message of pendingMessages) {
+					// user消息是没有 message_update 的
 					await emit({ type: "message_start", message });
 					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
+					currentContext.messages.push(message); // 面向LLM, 即上下文
+					newMessages.push(message); // 将本次agent loop新增的message存入newMessages数组, 以便在agent_end事件后一次性返回
 				}
 				pendingMessages = [];
 			}
@@ -192,8 +196,8 @@ async function runLoop(
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
+				await emit({ type: "turn_end", message, toolResults: [] }); // 面向UI
+				await emit({ type: "agent_end", messages: newMessages }); // 面向UI
 				return;
 			}
 
@@ -246,10 +250,14 @@ async function streamAssistantResponse(
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
+	// 💣 注意: transformContext和convertToLlm的调用次序和可选性
+
+	// 👇 可选，上下文裁剪/摘要/注入
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
 	}
 
+	// 👇 必需，过滤自定义消息类型
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
 
@@ -260,6 +268,7 @@ async function streamAssistantResponse(
 		tools: context.tools,
 	};
 
+	// 缺省情况下，使用 packages/ai/src/providers/register-builtins.ts 中注册的 streamSimple 作为默认的流式请求函数
 	const streamFunction = streamFn || streamSimple;
 
 	// Resolve API key (important for expiring tokens)
@@ -275,12 +284,14 @@ async function streamAssistantResponse(
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
+	// 这个for循环是整个agent loop中最核心的部分了，负责处理LLM流式请求的AssistantMessageEvent事件，并根据事件类型更新上下文、发出相应的AgentEvent事件
 	for await (const event of response) {
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;
 				context.messages.push(partialMessage);
 				addedPartial = true;
+				// 面向UI
 				await emit({ type: "message_start", message: { ...partialMessage } });
 				break;
 
@@ -296,6 +307,7 @@ async function streamAssistantResponse(
 				if (partialMessage) {
 					partialMessage = event.partial;
 					context.messages[context.messages.length - 1] = partialMessage;
+					// 也就是说只有 assistant 消息会产生 message_update, user 消息和 toolResult 消息不是流式的，一来就是完整的，不需要中间更新
 					await emit({
 						type: "message_update",
 						assistantMessageEvent: event,
@@ -313,8 +325,10 @@ async function streamAssistantResponse(
 					context.messages.push(finalMessage);
 				}
 				if (!addedPartial) {
+					// 面向UI
 					await emit({ type: "message_start", message: { ...finalMessage } });
 				}
+				// 面向UI
 				await emit({ type: "message_end", message: finalMessage });
 				return finalMessage;
 			}
@@ -678,6 +692,7 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 }
 
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
+	// toolResult 消息中间没有 message_update
 	await emit({ type: "message_start", message: toolResultMessage });
 	await emit({ type: "message_end", message: toolResultMessage });
 }

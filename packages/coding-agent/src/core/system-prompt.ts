@@ -36,9 +36,11 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 	} = options;
+	// cwd 由调用方传入 (resource-loader 决定)
 	const resolvedCwd = cwd;
 	const promptCwd = resolvedCwd.replace(/\\/g, "/");
 
+	// 获取当前日期，ISO 格式 YYYY-MM-DD
 	const now = new Date();
 	const year = now.getFullYear();
 	const month = String(now.getMonth() + 1).padStart(2, "0");
@@ -66,6 +68,13 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			}
 		}
 
+		/*
+			只有当 agent 拥有 read 工具时，才把 skill 列表追加到 system prompt。
+
+  			原因：skill 的渐进式披露机制依赖 read 工具 — 初始只展示 skill 的名称和简短描述，agent 需要用 read 去读取 SKILL.md 文件获取完整指令。
+			如果 agent 没有 read 工具，给它看 skill 列表也没用，它没法读取详情。
+		*/
+
 		// Append skills section (only if read tool is available)
 		const customPromptHasRead = !selectedTools || selectedTools.includes("read");
 		if (customPromptHasRead && skills.length > 0) {
@@ -90,6 +99,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const visibleTools = tools.filter((name) => !!toolSnippets?.[name]);
 	const toolsList =
 		visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets![name]}`).join("\n") : "(none)";
+
+	// 👇 根据内置的7个tool拼接出guidelines的文本
 
 	// Build guidelines based on which tools are actually available
 	const guidelinesList: string[] = [];

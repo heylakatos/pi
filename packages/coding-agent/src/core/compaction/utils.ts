@@ -98,6 +98,9 @@ function truncateForSummary(text: string, maxChars: number): string {
 	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
 }
 
+// 👇 把消息转成 [User]: ... / [Assistant]: ... 的纯文本格式
+// 这个设计意图是防止 LLM 把待摘要的对话当作正在进行的对话来回复
+
 /**
  * Serialize LLM messages to text for summarization.
  * This prevents the model from treating it as a conversation to continue.

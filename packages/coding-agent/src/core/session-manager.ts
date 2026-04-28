@@ -30,7 +30,7 @@ export const CURRENT_SESSION_VERSION = 3;
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this
-	id: string;
+	id: string; // type 为 "session" 时, id 是 sessionId, 其他 entry 的 id 是 entryId
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
@@ -44,6 +44,12 @@ export interface NewSessionOptions {
 export interface SessionEntryBase {
 	type: string;
 	id: string;
+	/*
+		parentId 构成树结构:
+		parentId 是树结构里当前节点的父节点 id。
+		线性对话时就是链表：每个 entry 的 parentId 指向上一条。
+		分支出现在同一个 parentId 有多个子节点时。
+	*/
 	parentId: string | null;
 	timestamp: string;
 }
@@ -53,11 +59,13 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	message: AgentMessage;
 }
 
+// 记录用户在会话中切换 thinking level
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	type: "thinking_level_change";
 	thinkingLevel: string;
 }
 
+// 记录用户在会话中切换 model
 export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
@@ -307,6 +315,8 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+// 👇 从session entries中提取出当前上下文(SessionContext, 主要是message history)给 agent 使用
+
 /**
  * Build the session context from entries using tree traversal.
  * If leafId is provided, walks from that entry to root.
@@ -356,6 +366,14 @@ export function buildSessionContext(
 	let model: { provider: string; modelId: string } | null = null;
 	let compaction: CompactionEntry | null = null;
 
+	/*
+	    👇 model值在session中的两个来源，后出现的覆盖前面的(因为是正序遍历，直接赋值)
+	    1. model_change entry — 用户主动切换模型时记录的
+        2. assistant 消息 — 每条 assistant 回复都带有 provider 和 model 字段
+	   	最终 model 是 path 上最后一条 assistant 消息或 model_change 的值，也就是会话中最近使用的模型。
+	    这样设计的原因：用户可能在一次会话中切换过多次模型（比如先用 Sonnet 再换 Opus），恢复时应该用最后一次使用的模型。
+	*/
+
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel;
@@ -387,7 +405,38 @@ export function buildSessionContext(
 		}
 	};
 
+	// 🦀 compaction 重建逻辑
 	if (compaction) {
+		/*
+
+			假设 path 是这样的：
+			[消息1, 消息2, ..., 消息30, 消息31, ..., 消息50, compaction, 消息51, ..., 消息N]
+									   ↑                      ↑
+									firstKeptEntryId       compaction 节点
+
+			compaction 记录了两个关键信息：
+				- summary — 被压缩掉的消息的摘要
+				- firstKeptEntryId — 压缩时保留的最早那条消息（切割点）
+
+			重建出的消息列表：
+
+			① summary（压缩摘要）
+			② 消息31..消息50（compaction 之前，从 firstKeptEntryId 开始的保留消息）
+			③ 消息51..消息N（compaction 之后的所有消息）
+
+			消息 1-30 被丢弃了，它们的内容已经浓缩在 summary 里。
+			用图表示：
+
+			原始 path:  [msg1 ... msg30 | msg31 ... msg50 | compaction | msg51 ... msgN]
+						─────丢弃─────   ──②保留消息──       ──跳过──     ──③后续消息──
+							  ↓
+						──①summary──
+
+			最终输出:   [summary, msg31...msg50, msg51...msgN]
+
+			这样 LLM 拿到的上下文 = 历史摘要 + 最近的完整消息，既省 token 又不丢关键上下文。
+		*/
+
 		// Emit summary first
 		messages.push(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
 
@@ -412,6 +461,7 @@ export function buildSessionContext(
 			appendMessage(entry);
 		}
 	} else {
+		// 👇 没有 compaction 时，遍历所有 entry，appendMessage 会处理三种类型: message, custom_message, branch_summary
 		// No compaction - emit all messages, handle branch summaries and custom messages
 		for (const entry of path) {
 			appendMessage(entry);
@@ -425,6 +475,8 @@ export function buildSessionContext(
  * Compute the default session directory for a cwd.
  * Encodes cwd into a safe directory name under ~/.pi/agent/sessions/.
  */
+// safePath是把 "/Users/synix/workspace/grokking/projects/pi-mono/packages/coding-agent" 转成 "--Users-synix-workspace-grokking-projects-pi-mono-packages-coding-agent--"
+// sessionDir, 类似于 "/Users/synix/.pi/agent/sessions/--Users-synix-workspace-grokking-projects-pi-mono-packages-coding-agent--"
 export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {
 	const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 	const sessionDir = join(agentDir, "sessions", safePath);
@@ -672,11 +724,23 @@ export class SessionManager {
 	private sessionDir: string;
 	private cwd: string;
 	private persist: boolean;
+	/*
+		flushed 表示内存中的 fileEntries 是否已经写入过磁盘。
+			flushed = false  → 内存里有数据，但磁盘上还没写过（或有新积攒的）
+			flushed = true   → 内存里的数据已经全部写入磁盘了
+	*/
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
+
+	// 让 getEntry(id) 可以 O(1) 查找，不用遍历fileEntries数组
 	private byId: Map<string, SessionEntry> = new Map();
+
+	// targetId → label
+	// targetId 是被打标签(书签功能)的那个 entry 的 id
+	// label entry 本身是树上的一个节点（有自己的 id 和 parentId），但它的作用是给另一个节点起个名字。targetId 就指向那个被命名的节点。
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
+	// fileEntries中最后一个 entry 的 id, 或者说当前 leaf 的 id
 	private leafId: string | null = null;
 
 	private constructor(cwd: string, sessionDir: string, sessionFile: string | undefined, persist: boolean) {
@@ -746,6 +810,8 @@ export class SessionManager {
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+			// sessionFile即session文件名格式:
+			// {timestamp}_{sessionId}.jsonl, e.g., "2026-02-15T13-55-17-544Z_8869c37c-b40b-47e9-a48b-2a2e9b505814.jsonl"
 			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
 		}
 		return this.sessionFile;
@@ -801,6 +867,13 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
+		/*
+			延迟写入优化:
+			SessionHeader 实际写入磁盘的时机是：第一条 assistant 消息到来时，和所有之前积攒的 entry 一起批量写入。
+			这个设计的目的是：如果用户打开会话但没有和 AI 对话就退出了，不会在磁盘上留下空的 session文件。
+			只有当 LLM 真正回复了，才认为这是一个有效会话，值得持久化。
+		*/
+
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			// Mark as not flushed so when assistant arrives, all entries get written
@@ -809,11 +882,13 @@ export class SessionManager {
 		}
 
 		if (!this.flushed) {
+			// 第一次写：把 fileEntries 全部写入（header + 所有积攒的 entry）
 			for (const e of this.fileEntries) {
 				appendFileSync(this.sessionFile, `${JSON.stringify(e)}\n`);
 			}
 			this.flushed = true;
 		} else {
+			// 后续写：只 append 当前这一条新 entry
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
 		}
 	}
@@ -1115,6 +1190,13 @@ export class SessionManager {
 	// =========================================================================
 	// Branching
 	// =========================================================================
+
+	/*
+		branch() 的实现极其简单——就是移动 leafId 指针。
+			this.leafId = branchFromId;
+		一行代码。不删除任何东西，不复制任何东西。
+		下次 appendXXX() 时，新 entry 的 parentId 会指向这个 branchFromId，自然形成分叉(branch)。
+	 */
 
 	/**
 	 * Start a new branch from an earlier entry.

@@ -16,6 +16,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageRoot = join(__dirname, "..");
 
+// 定义 https://models.dev/api.json 返回的 PROVIDER ID 对应的模型结构
+// 这里只是按需定义了部分字段，实际返回的数据包含更多字段
 interface ModelsDevModel {
 	id: string;
 	name: string;
@@ -28,6 +30,9 @@ interface ModelsDevModel {
 	cost?: {
 		input?: number;
 		output?: number;
+		// 这是关于Prompt Caching功能的定价字段
+		//  | cache_write │ 写入缓存的价格 │ 首次处理该前缀时，需要额外付费将其存入缓存                    │
+		//  │ cache_read  │ 读取缓存的价格 │ 后续请求命中缓存时，按此价格计费（通常比普通 input 便宜很多）|
 		cache_read?: number;
 		cache_write?: number;
 	};
@@ -98,6 +103,7 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 			if (!model.supported_parameters?.includes("tools")) continue;
 
 			// Parse provider from model ID
+			// 这里provider统一设置为openrouter
 			let provider: KnownProvider = "openrouter";
 			let modelKey = model.id;
 
@@ -179,7 +185,7 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 				name: model.name || model.id,
 				api: "anthropic-messages",
 				baseUrl: AI_GATEWAY_BASE_URL,
-				provider: "vercel-ai-gateway",
+				provider: "vercel-ai-gateway", // 统一设置provider为vercel-ai-gateway
 				reasoning: tags.includes("reasoning"),
 				input,
 				cost: {
@@ -204,25 +210,82 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 async function loadModelsDevData(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from models.dev API...");
+		// See https://models.dev/
+		// models.dev 是一个开源的AI模型数据库/目录网站
 		const response = await fetch("https://models.dev/api.json");
 		const data = await response.json();
 
 		const models: Model<any>[] = [];
 
+		// data里面每个key是一个provider ID，每个provider下面有一个models对象，models对象的key是model ID，value是模型的详细信息(参考上面的类型ModelsDevModel)
+
 		// Process Amazon Bedrock models
 		if (data["amazon-bedrock"]?.models) {
+			/*
+			  返回的数据结构如下:
+			   "amazon-bedrock": {
+					"id": "amazon-bedrock",
+					"env": [
+						"AWS_ACCESS_KEY_ID",
+						"AWS_SECRET_ACCESS_KEY",
+						"AWS_REGION"
+					],
+					"npm": "@ai-sdk/amazon-bedrock",
+					"name": "Amazon Bedrock",
+					"doc": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
+					"models": {
+						"us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+							"id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+							"name": "Claude Sonnet 4.5 (US)",
+							"family": "claude-sonnet",
+							"attachment": true,
+							"reasoning": true,
+							"tool_call": true,
+							"temperature": true,
+							"knowledge": "2025-07-31",
+							"release_date": "2025-09-29",
+							"last_updated": "2025-09-29",
+							"modalities": {
+								"input": [
+									"text",
+									"image",
+									"pdf"
+								],
+								"output": [
+									"text"
+								]
+							},
+							"open_weights": false,
+							"cost": {
+								"input": 3,
+								"output": 15,
+								"cache_read": 0.3,
+								"cache_write": 3.75
+							},
+							"limit": {
+								"context": 200000,
+								"output": 64000
+							}
+					   },
+						...
+			  	    }
+		        }
+			 */
 			for (const [modelId, model] of Object.entries(data["amazon-bedrock"].models)) {
 				const m = model as ModelsDevModel;
+				// 只有tool_call为true的模型才支持工具调用, 才会被我们纳入支持的模型列表中
 				if (m.tool_call !== true) continue;
 
 				let id = modelId;
 
 				if (id.startsWith("ai21.jamba")) {
+					// 排除支持 tool call 但不支持 streaming 的模型
 					// These models doesn't support tool use in streaming mode
 					continue;
 				}
 
 				if (id.startsWith("mistral.mistral-7b-instruct-v0")) {
+					// 排除支持 支持 tool call 但不支持 system message 的模型
 					// These models doesn't support system messages
 					continue;
 				}
@@ -755,6 +818,8 @@ async function generateModels() {
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);
+
+	// 👇 这些都是临时补丁, 用来修正 models.dev 上游数据的错误, 补齐缺失的模型信息
 
 	// Fix incorrect cache pricing for Claude Opus 4.5 from models.dev
 	// models.dev has 3x the correct pricing (1.5/18.75 instead of 0.5/6.25)

@@ -159,6 +159,11 @@ export class FileSettingsStorage implements SettingsStorage {
 	private projectSettingsPath: string;
 
 	constructor(cwd: string, agentDir: string) {
+		/*
+			这个项目有两层设置:
+			1. ~/.pi/agent/settings.json          ← 全局设置（用户级）
+			2. <项目目录>/.pi/settings.json        ← 项目设置（项目级）
+		*/
 		this.globalSettingsPath = join(agentDir, "settings.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
 	}

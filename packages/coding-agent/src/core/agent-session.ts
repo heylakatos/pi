@@ -110,6 +110,9 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 	};
 }
 
+/**
+ * 在 AgentEvent 4大类型事件 和 10大事件的基础上, 增加了 2大类型(auto_compaction/auto_retry) 和 4大事件
+ */
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
 	| AgentEvent
@@ -232,6 +235,13 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** Thinking levels including xhigh (for supported models) */
 const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
+/*
+	🤔  AgentSession 和 SessionManager 有什么区别？
+	两层不同的职责:
+	1. AgentSession — 编排层，管整个session的生命周期
+	2. SessionManager — 纯数据层，只管session的持久化
+ */
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -319,6 +329,9 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+
+		// 🐂 这里是本仓库以及AgentSession唯一订阅 agent 事件的地方
+		// 订阅后所有事件都会经过 _handleAgentEvent()
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -493,12 +506,30 @@ export class AgentSession {
 	}
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
+		// steering 和 follow-up 队列里的消息是"待发送"的, 一旦确认已经作为用户消息发出去了，就从队列里消费掉，防止重复发送
+		// steering 优先级高于follow-up，所以先检查 steering
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
+				/*
+					这里进行文本内容匹配，逻辑上有潜在问题:
+
+					如果两条不同来源的消息恰好文本相同，比如 steering 队列和 follow-up 队列各有一条内容一样的消息，这段代码只会消费 steering 那条（因为先查steering），follow-up 那条就永远留在队列里不会被清除。
+
+					更明显的问题是同一队列内的重复：如果 steering 队列里有两条相同文本的消息，indexOf 只找到第一条并移除，第二条还在。
+					但实际发出去的可能是第二条，第一条反而被错误消费了——不过由于文本相同，实际效果可能没区别。
+
+					不过实践中这大概率不是真正的 bug：
+					- steering 和 follow-up 的消息通常由不同逻辑路径生成，内容重复的概率很低
+					- 即使偶尔有残留消息，队列在下一轮循环中会被重新检查或清空
+
+					用 ID 匹配而非文本匹配会更健壮，但对于当前场景，这种简单实现够用了。
+				*/
+
 				// Check steering queue first
 				const steeringIndex = this._steeringMessages.indexOf(messageText);
 				if (steeringIndex !== -1) {
@@ -540,6 +571,15 @@ export class AgentSession {
 				// Regular LLM message - persist as SessionMessageEntry
 				this.sessionManager.appendMessage(event.message);
 			}
+
+			/*
+				除了常规的 user/assistant/toolResult 消息会被持久化到 session 之外，还有 
+				bashExecution、compactionSummary、branchSummary 这几种消息类型也会被持久化，但不是在当前这个代码路径写入的，而是在其他地方单独处理。
+
+  				比如 compaction 摘要由 compaction 流程自己写入 session，
+				branch summary 由分支切换逻辑写入 —— 它们各自有专门的持久化入口，不走这里统一的消息写入逻辑。
+			*/
+
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			// Track assistant message for auto-compaction (checked on agent_end)
@@ -551,6 +591,15 @@ export class AgentSession {
 					this._overflowRecoveryAttempted = false;
 				}
 
+				/*
+					当 assistant 成功响应（stopReason 不是 error）且之前有过重试（_retryAttempt > 0）时:
+						1. 发出 auto_retry_end 事件，标记重试成功
+						2. 重置重试计数器归零
+						3. 调用 _resolveRetry() 解除重试等待的 Promise
+					关键是注释说的：在收到成功响应时立即重置，而不是等到 turn 结束。
+					因为一个 turn 内可能有多次 LLM 调用（比如工具调用后继续对话），如果不及时重置，重试计数会跨 LLM 调用累积，导致后面
+					某次调用失败时以为已经重试了很多次而提前放弃。
+				*/
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
@@ -563,6 +612,11 @@ export class AgentSession {
 				}
 			}
 		}
+
+		/*
+			当 agent loop 结束时，把缓存的最后一条 assistant 消息取出来并清空引用。
+  			这是为了在 agent_end 之后对这条消息做后续的 auto-retry 和 auto-compaction 处理 —— 先取出再清空，确保只处理一次。
+		*/
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end" && this._lastAssistantMessage) {
@@ -940,6 +994,14 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		/*
+			👇 只处理了 extension command 这1种slash command
+			如果用户输入的 /xxx 匹配到extension注册的命令，就立即执行并 return，不走后续的 prompt() 流程。
+			变量名 expandPromptTemplates 容易误导，但它在这里只是个开关——控制是否要解析 /开头的输入。
+			prompt template 和 skill 的处理在后续代码里，不在这段。
+		*/
+
+		// expandPromptTemplates 实际控制的是"是否解析所有 / 开头的输入"（包括 extension command），名不副实。
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1082,6 +1144,8 @@ export class AgentSession {
 
 		preflightResult?.(true);
 		await this.agent.prompt(messages);
+		//  如果没有重试在进行（_retryPromise 是 undefined），立即返回，不阻塞。
+		//   这样保证 prompt() 方法返回时，重试流程一定已经结束，调用方拿到的是最终结果。
 		await this.waitForRetry();
 	}
 
@@ -1597,7 +1661,11 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		// 在执行 compaction 之前，先断开 agent 事件监听并中止当前正在进行的 LLM 请求
+
+		// 取消对 agent 事件的订阅，防止 compaction 期间 agent 的状态变化触发不必要的事件处理
 		this._disconnectFromAgent();
+		// 中止当前可能正在进行的 LLM streaming 请求，因为 compaction 会替换消息列表，继续接收旧请求的响应没有意义
 		await this.abort();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
@@ -1722,6 +1790,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
+			// compaction 完成后会重新连接 agent 并恢复执行
 			this._reconnectToAgent();
 		}
 	}
@@ -1741,6 +1810,25 @@ export class AgentSession {
 		this._branchSummaryAbortController?.abort();
 	}
 
+	/*
+		`_checkCompaction` 2个调用点说明了`skipAbortedCheck`这个参数的作用:
+
+		调用点 1: agent_end 事件回调里, LLM 刚回复完:
+			await this._checkCompaction(msg); // skipAbortedCheck = true(默认)
+			如果用户按了 Ctrl+C 中断(stopReason === "aborted"), 就跳过检查——用户主动取消的, 没必要压缩
+
+		调用点 2: 用户提交新消息之前(AgentSession.prompt()) (也就是下面所谓的 "pre-prompt check"):
+			这里 skipAbortedCheck 传了 false，意思是: 即使上一条 assistant 消息是 aborted 的，也要检查压缩。
+
+		为什么需要这个 pre-prompt check?
+		场景:
+			上下文已经快满了 → LLM 开始回复 → 用户按 Ctrl+C 取消 → agent_end 里因为 skipAbortedCheck=true 跳过了压缩检查。
+			此时上下文依然快满。如果没有 pre-prompt check, 用户下次发消息就会直接撞上上下文窗口上限。
+
+		所以在用户提交新 prompt 之前, 再检查一次最后的 assistant 消息(这次不跳过 aborted), 确保上下文还有空间容纳新消息。
+		简单说: agent_end 时检查是正常路径, pre-prompt check 是兜底路径, 专门捕捉因用户取消而漏掉的压缩时机。
+	*/
+
 	/**
 	 * Check if compaction is needed and run it.
 	 * Called after agent_end and before prompt submission.
@@ -1753,8 +1841,34 @@ export class AgentSession {
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<void> {
+		/*
+			💥 检查 LLM 回复后是否需要压缩上下文，两种触发条件：
+
+			Case 1: Overflow(溢出)
+				LLM 报了 context overflow 错误
+				→ 删掉错误消息 → 立即压缩 → 自动重试请求
+
+			Case 2: Threshold(阈值)
+				请求成功了，但 token 用量接近上下文窗口上限
+				→ 后台压缩 → 不重试（用户继续手动操作）
+
+			还有几个防御性检查：
+				- compaction 被禁用 → 跳过
+				- 用户取消了（aborted）→ 跳过
+				- 切换了模型后旧模型的错误 → 跳过（新模型窗口可能更大）
+				- 错误发生在已压缩区域之前 → 跳过（避免重复压缩）
+		*/
+
+		// compaction 被禁用 → 跳过
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return;
+
+		/*
+			用户按了取消（比如 Ctrl+C），LLM 回复被中断，stopReason 就是"aborted"。这时候不需要检查压缩——用户主动中断的，不是上下文满了。
+			skipAbortedCheck 参数控制是否跳过这个检查：
+				- true（默认，agent_end 之后调用）→ 跳过 aborted 的消息，不检查压缩
+				- false（prompt 提交前调用）→ 即使上一条是 aborted也要检查，因为用户要发新消息了，得确保上下文够用
+		 */
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return;
@@ -1798,6 +1912,7 @@ export class AgentSession {
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+				// 去掉数组最后一个元素，返回剩余部分。
 				this.agent.state.messages = messages.slice(0, -1);
 			}
 			await this._runAutoCompaction("overflow", true);
@@ -1807,6 +1922,10 @@ export class AgentSession {
 		// Case 2: Threshold - context is getting large
 		// For error messages (no usage data), estimate from last successful response.
 		// This ensures sessions that hit persistent API errors (e.g. 529) can still compact.
+
+		// 旧逻辑：error 时直接跳过阈值检查（因为没有 usage 数据）。
+		// 新逻辑：error 时从历史消息中找最近一条有 usage 的 assistant 消息来估算 token 用量，
+		// 这样即使遇到持续的 API 错误（如 529）也能触发 compaction，防止 context 无限膨胀。
 		let contextTokens: number;
 		if (assistantMessage.stopReason === "error") {
 			const messages = this.agent.state.messages;
@@ -1880,6 +1999,8 @@ export class AgentSession {
 				return;
 			}
 
+			// 之所以把compact机制拆分为 prepareCompaction + compact，是为了给 extension 提供一个机会，在真正调用 LLM 生成压缩摘要之前先看看 extension 自己能不能提供压缩结果（extensionCompaction）。
+			// 如果 extension 没有提供（extensionCompaction 为空），才调用默认的 compact 逻辑生成压缩摘要。
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
 
@@ -1948,10 +2069,15 @@ export class AgentSession {
 				return;
 			}
 
+			// 把摘要写入 session 持久化存储，作为一条新的 compaction entry。firstKeptEntryId 告诉 session manager 从哪条 entry 开始保留原始消息，之前的旧消息可以被摘要替代。
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
+			// 重新构建 session 上下文。此时 session manager 会用 compaction 摘要 + 保留的近期消息重新组装消息列表，而不是用全部原始消息。
 			const sessionContext = this.sessionManager.buildSessionContext();
+			// 把压缩后的新消息列表热替换到正在运行的 agent loop 中。这样下一次 LLM 调用就会用压缩后的上下文，而不需要重启 session。
 			this.agent.state.messages = sessionContext.messages;
+
+			// 👆 简单说：写摘要 → 重建上下文 → 热替换到 agent，让 compaction 在不中断对话的情况下立即生效。
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -1974,6 +2100,11 @@ export class AgentSession {
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 
+			/*
+				compaction 是因为 LLM 返回了 context window 超限错误而触发的。
+				压缩完成后需要重试那次失败的请求。但先把最后一条 stopReason === "error" 的 assistant 消息删掉（那是错误响应，没用），然后 setTimeout 异步重新调用 agent.continue() 让 agent loop 继续。
+			*/
+
 			if (willRetry) {
 				const messages = this.agent.state.messages;
 				const lastMsg = messages[messages.length - 1];
@@ -1985,12 +2116,18 @@ export class AgentSession {
 					this.agent.continue().catch(() => {});
 				}, 100);
 			} else if (this.agent.hasQueuedMessages()) {
+				/*
+					compaction是常规触发的（非错误），但压缩期间用户可能又发了新消息（排队中）。压缩完后需要踢一下 agent loop，让排队的消息被处理。
+				*/
+
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
 				setTimeout(() => {
 					this.agent.continue().catch(() => {});
 				}, 100);
 			}
+
+			// 👆 两者都用 setTimeout(..., 100) 是为了避免在当前事件处理回调中同步重入 agent loop，把继续执行推到下一个事件循环。
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			this._emit({
@@ -2448,6 +2585,14 @@ export class AgentSession {
 			return false;
 		}
 
+		/*
+			指数退避等待(Wait with exponential backoff), 计算等待时间。
+			假设 baseDelayMs = 1000：
+				第1次重试: 1000 * 2^0 = 1000ms  (1秒)
+				第2次重试: 1000 * 2^1 = 2000ms  (2秒)
+				第3次重试: 1000 * 2^2 = 4000ms  (4秒)
+			每次等待时间翻倍，避免在服务器过载时疯狂重试加重负担。
+		*/
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 
 		this._emit({
@@ -2783,8 +2928,19 @@ export class AgentSession {
 			let newLeafId: string | null;
 			let editorText: string | undefined;
 
+			/*
+				👇 这是用户在 TUI 中导航到某条历史消息时， 决定 leafId 怎么移动的逻辑:
+				如果导航到 user 消息或 custom_message:
+					leafId 设为它的父节点(而不是它本身), 同时提取文本放到编辑器里
+					这意味着用户想重新编辑并发送这条消息 —— leaf 回退到上一条，编辑器预填内容，用户修改后发送就自然形成新分支
+				如果导航到非 user 消息(比如 assistant 回复):
+					leafId设为它本身。这意味着用户想从这个点继续对话，下次发送的消息会以它为 parent。
+
+				 本质区别：user 消息是"我要重新说这句话"（回退+编辑），非 user 消息是"我要从这里接着聊"（定位+继续）
+			*/
 			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
 				// User message: leaf = parent (null if root), text goes to editor
+				// 当用户导航到第一条 user 消息(树的根节点) 并想重新编辑它时, targetEntry.parentId 就是 null(根节点没有 parent), 所以 newLeafId === null
 				newLeafId = targetEntry.parentId;
 				editorText = this._extractUserMessageText(targetEntry.message.content);
 			} else if (targetEntry.type === "custom_message") {
@@ -2806,6 +2962,11 @@ export class AgentSession {
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
 			if (summaryText) {
+				// 1. 有摘要(summaryText 存在):
+				// 调用 branchWithSummary，在目标位置 newLeafId 创建新分支并注入旧分支的摘要，这样新分支不会丢失旧分支的上下文。
+				// 即摘要不是存在旧分支上，而是通过 branchWithSummary(newLeafId, ...) 存在新分支的起点。
+				// 如果有 label 还会给摘要 entry 打个书签。
+
 				// Create summary at target position (can be null for root)
 				const summaryId = this.sessionManager.branchWithSummary(
 					newLeafId,
@@ -2820,9 +2981,15 @@ export class AgentSession {
 					this.sessionManager.appendLabelChange(summaryId, label);
 				}
 			} else if (newLeafId === null) {
+				// 2. 无摘要 + 导航到根 (newLeafId === null):
+				// 用户要重新编辑第一条消息, 调用 resetLeaf() 把 leafId 置空, 下次 append 会创建新的根 entry。
+
 				// No summary, navigating to root - reset leaf
 				this.sessionManager.resetLeaf();
 			} else {
+				// 3. 无摘要 + 导航到非根节点:
+				// 普通的分支操作, branch(newLeafId) 移动指针即可。
+
 				// No summary, navigating to non-root
 				this.sessionManager.branch(newLeafId);
 			}

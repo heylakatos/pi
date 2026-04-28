@@ -2,6 +2,7 @@ import type { AssistantMessageEventStream } from "./utils/event-stream.js";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream.js";
 
+// 表示调用模型时使用的API类型
 export type KnownApi =
 	| "openai-completions"
 	| "mistral-conversations"
@@ -14,8 +15,13 @@ export type KnownApi =
 	| "google-gemini-cli"
 	| "google-vertex";
 
+// Api 是一个类型定义，表示所有可能的 API 类型：
+//  - KnownApi - 已知的、有类型提示的 API 类型
+//  - (string & {}) - 允许任意字符串（用于扩展性），但不会破坏自动补全
+// 这个 (string & {}) 是一个 TypeScript 技巧，让类型既能接受任意字符串，又能在 IDE 中提供已知值的自动补全。
 export type Api = KnownApi | (string & {});
 
+// 目前支持的provider列表
 export type KnownProvider =
 	| "amazon-bedrock"
 	| "anthropic"
@@ -43,6 +49,8 @@ export type KnownProvider =
 	| "opencode-go"
 	| "kimi-coding"
 	| "cloudflare-workers-ai";
+
+
 export type Provider = KnownProvider | string;
 
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -129,6 +137,14 @@ export interface StreamOptions {
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
+
+/**
+  用户可以自定义每个 thinking level（minimal/low/medium/high/xhight）对应多少 thinking budget，覆盖 provider 内置的默认值（如 bedrock 默认 high=16384，见 packages/ai/src/providers/amazon-bedrock.ts）
+
+  "token-based providers only" 👈 暗含不同 provider 控制"思考强度"的API不一样，分为两类：
+    1. Token-based：Anthropic、Google Gemini等。API 接受一个具体数字 budget_tokens: 16384，表示"最多用这么多 token 思考"。 👉 对这类 provider thinkingBudgets 才有效。
+    2. Effort-based：OpenAI Responses (reasoning_effort: "high")、xAI 等。API 只收 "low"|"medium"|"high" 这种枚举值，根本没有"token budgets"这个概念。 👉 对这类 provider 传 thinkingBudgets 会被忽略。
+ */
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
@@ -235,12 +251,32 @@ export interface ToolResultMessage<TDetails = any> {
 
 export type Message = UserMessage | AssistantMessage | ToolResultMessage;
 
+/*
+	💀 typebox 的 TSchema / Static<T> 魔法
+	typebox 让同一份定义既是 runtime 的 JSON Schema (给 LLM)又是 compile-time 的TypeScript类型 (给开发者):
+
+	举个例子:
+	const FileReadParams = Type.Object({
+		path: Type.String(),
+		offset: Type.Optional(Type.Number()),
+	});
+
+	// Runtime: FileReadParams是标准 JSON Schema(发给 LLM)
+	// { type: "object", properties: { path: { type: "string" }, ... } }
+
+	// Compile-time: Static<typeof FileReadParams> 推导出TypeScript类型
+	// { path: string; offset?: number }
+
+	TSchema 是 TypeBox 中所有 JSON Schema 类型的基类型/顶层类型，代表"任意 JSON Schema"。
+	所有 TypeBox 构造器（Type.String(), Type.Object({...}) 等）返回的值都满足 TSchema。
+ */
+
 import type { TSchema } from "typebox";
 
 export interface Tool<TParameters extends TSchema = TSchema> {
-	name: string;
-	description: string;
-	parameters: TParameters;
+	name: string; // 面向LLM的tool name
+	description: string; // 面向LLM的tool description
+	parameters: TParameters; // JSON Schema for tool parameters, 面向LLM的tool参数定义
 }
 
 export interface Context {
@@ -248,6 +284,12 @@ export interface Context {
 	messages: Message[];
 	tools?: Tool[];
 }
+
+/**
+ * AssistantMessageEvent(12种): LLM 流式请求的事件协议
+ * 表示流式请求开始/结束的3种事件: start, end/error
+ * 表示3种内容块(text/thinking/toolcall)的开始/增量输出/结束的9种事件: start/delta/end
+ */
 
 /**
  * Event protocol for AssistantMessageEventStream.

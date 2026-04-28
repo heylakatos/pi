@@ -103,6 +103,12 @@ export interface AfterToolCallContext {
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
+	/*
+		convertToLlm(必需配置项): 过滤自定义消息类型
+		- 通过 `CustomAgentMessages` 也就是declaration merging注入的 app 专属消息类型不发给 LLM
+		- 只保留 user/assistant/toolResult 这3种喂给LLM的message
+	 */
+
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *
@@ -130,6 +136,17 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * ```
 	 */
 	convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+
+	/*
+		transformContext(可选配置项): 用于上下文裁剪/摘要/注入, 控制 token 消耗
+		- 消息裁剪/截断（长对话场景）
+		- 中间消息摘要压缩
+		- 外部上下文注入(RAG、知识库)
+		- 消息去重
+
+    而且这里强调了transformContext() 和 convertToLlm() 的先后次序.
+    其实通过这两个函数的参数和返回值类型也不难看出, AgentMessage[] -> transformContext() -> AgentMessage[] -> convertToLlm() -> Message[]
+	*/
 
 	/**
 	 * Optional transform applied to the context before `convertToLlm`.
@@ -163,6 +180,43 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 
+	// 下面两者都用于在 Agent 运行过程中注入额外消息, 但时机和用途不同:
+	/*
+		对比
+		┌──────────┬─────────────────────┬─────────────────────┐
+		│          │ getSteeringMessages │ getFollowUpMessages │
+		├──────────┼─────────────────────┼─────────────────────┤
+		│ 调用时机 │ 工具执行后          │ Agent 准备停止时    │
+		├──────────┼─────────────────────┼─────────────────────┤
+		│ 用途     │ 中途打断/转向       │ 追加后续任务        │
+		├──────────┼─────────────────────┼─────────────────────┤
+		│ 优先级   │ 高（跳过剩余工具）  │ 低（等 Agent 空闲） │
+		├──────────┼─────────────────────┼─────────────────────┤
+		│ 典型场景 │ 用户紧急干预        │ 消息队列处理        │
+		└──────────┴─────────────────────┴─────────────────────┘
+		流程图
+
+		Agent 循环:
+			LLM 调用 → 返回工具调用
+				↓
+			执行工具1
+				↓
+			getSteeringMessages() → 有消息? → 跳过剩余工具，开始新 LLM 调用
+				↓ (无消息)
+			执行工具2
+				↓
+			getSteeringMessages() → ...
+				↓
+			所有工具执行完
+				↓
+			getSteeringMessages() → 有消息? → 新 LLM 调用
+				↓ (无消息)
+			getFollowUpMessages() → 有消息? → 新 LLM 调用
+				↓ (无消息)
+      		Agent 停止
+	*/
+
+	// 👇 中途打断/转向
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
@@ -176,6 +230,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
 
+	// 👇 追加后续
 	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
 	 *
@@ -230,6 +285,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
  */
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+// 应用层可以通过 declaration merging 扩展消息类型
+// 自定义消息类型会出现在 `AgentState.messages` 中(面向UI) 但会被 `convertToLlm()` 过滤掉(不发给 LLM)
+
 /**
  * Extensible interface for custom app messages.
  * Apps can extend via declaration merging:
@@ -245,6 +303,7 @@ export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhi
  * ```
  */
 export interface CustomAgentMessages {
+	// 应用在这里添加自定义消息类型
 	// Empty by default - apps extend via declaration merging
 }
 
@@ -315,10 +374,10 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	prepareArguments?: (args: unknown) => Static<TParameters>;
 	/** Execute the tool call. Throw on failure instead of encoding errors in `content`. */
 	execute: (
-		toolCallId: string,
-		params: Static<TParameters>,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<TDetails>,
+		toolCallId: string, // LLM 返回的 toolcall id, 用于关联 LLM工具调用 和 实际工具代码执行 的结果
+		params: Static<TParameters>, // ← 关键：TypeBox 把 Schema 变成了类型安全的 TS 对象
+		signal?: AbortSignal, // 用于工具执行过程中被外部中断（如用户取消）
+		onUpdate?: AgentToolUpdateCallback<TDetails>, // 流式进度回调
 	) => Promise<AgentToolResult<TDetails>>;
 	/**
 	 * Per-tool execution mode override.
@@ -339,6 +398,14 @@ export interface AgentContext {
 	/** Tools available for this run. */
 	tools?: AgentTool<any>[];
 }
+
+/**
+ * AgentEvent 是 Agent运行过程中发出来的面向UI也就是给UI消费的事件
+ * 分为10种, 4大生命周期类型(agent/turn/message/tool)
+ *
+ * message_update 事件包含了 AssistantMessageEvent 字段
+ * 即 assistantMessageEvent 字段透传了 AssistantMessageEvent(12种) 里的 9 种流式内容块事件(thinking, text, toolcall)
+ */
 
 /**
  * Events emitted by the Agent for UI updates.

@@ -290,6 +290,8 @@ export function validateToolCall(tools: Tool[], toolCall: ToolCall): any {
  * @throws Error with formatted message if validation fails
  */
 export function validateToolArguments(tool: Tool, toolCall: ToolCall): any {
+	// 深拷贝一份参数。因为 Value.Convert 会就地修改传入的对象 (比如把字符串 "42" coerce 成数字 42)。
+	// 如果不深拷贝，原始的 toolCall.arguments 就会被污染。
 	const args = structuredClone(toolCall.arguments);
 	Value.Convert(tool.parameters, args);
 

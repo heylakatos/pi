@@ -363,6 +363,10 @@ export const streamSimpleOpenAIResponses = createLazySimpleStream(loadOpenAIResp
 const streamBedrockLazy = createLazyStream(loadBedrockProviderModule);
 const streamSimpleBedrockLazy = createLazySimpleStream(loadBedrockProviderModule);
 
+/**
+	registerBuiltInApiProviders 的作用是注册所有内置的 API 类型，建立 api 类型到具体实现函数的映射。
+	当调用 packages/ai/src/stream.ts 里的 streamSimple(model, context, options) 时，代码根据 model.api 查找对应的实现函数并调用。
+ */
 export function registerBuiltInApiProviders(): void {
 	registerApiProvider({
 		api: "anthropic-messages",

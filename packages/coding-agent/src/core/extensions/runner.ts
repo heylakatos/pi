@@ -989,6 +989,26 @@ export class ExtensionRunner {
 		return { skillPaths, promptPaths, themePaths };
 	}
 
+	/*
+	 	👇 emitInput 在用户输入到达后、agent 处理前， 让所有扩展有机会拦截或修改用户输入。
+
+		链式处理逻辑：
+
+		用户输入 "hello"
+			→ extension A 的 input handler
+			├── 返回 { action: "handled" }    → 短路，直接返回，不再往下走
+			├── 返回 { action: "transform", text: "HELLO" }  → 修改文本，继续传给下一个扩展
+			└── 返回 undefined                → 不修改，继续传给下一个扩展
+			→ extension B 的 input handler
+			└── ...
+			→ 最终结果交给 agent 处理
+
+		两个用途：
+		1. 拦截（"handled"）— 扩展自己处理了这条输入，不需要发给 LLM
+		2. 变换（"transform"）— 修改输入文本或图片后继续流程，比如自动翻译、宏展开等
+
+	*/
+
 	/** Emit input event. Transforms chain, "handled" short-circuits. */
 	async emitInput(text: string, images: ImageContent[] | undefined, source: InputSource): Promise<InputEventResult> {
 		const ctx = this.createContext();
@@ -1015,6 +1035,13 @@ export class ExtensionRunner {
 				}
 			}
 		}
+
+		/*
+		 	所有extensions都处理完了（没有任何extension返回 "handled"），检查文本或图片是否被修改过：
+			- 被修改了 → 返回 { action: "transform", text: 修改后的文本 }，告诉调用方用修改后的内容
+			- 没被修改 → 返回 { action: "continue" }，告诉调用方用原始输入继续
+			就是把链式处理的最终结果汇总返回给调用方。
+		*/
 		return currentText !== text || currentImages !== images
 			? { action: "transform", text: currentText, images: currentImages }
 			: { action: "continue" };

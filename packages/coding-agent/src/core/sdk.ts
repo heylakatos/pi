@@ -187,6 +187,7 @@ function getAttributionHeaders(
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd();
+	// agentDir也就是用户配置文件夹, 默认是 ~/.pi/agent
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
@@ -208,7 +209,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
+	// thinking_level_change 表示session里用户切换过 thinking level
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+
+	// 🧠 下面分 3 步来 决策 用哪个模型(model), 这些代码抽离成一个函数来封装更合适
+	/*
+		3步决定用哪个模型，优先级从高到低：
+		1. options.model（调用者显式指定）
+			↓ 没有
+		2. 从已有会话恢复（existingSession.model）
+			→ 找到模型 + API key 有效 → 用它
+			→ 找不到或没 key → 记一条警告，继续往下
+			↓ 还是没有
+		3. findInitialModel(从 settings 默认值 / provider 默认值里找)
+			→ 找到 → 用它，并在警告后面追加 "Using xxx"
+			→ 没找到 → 提示用户 /login 或设环境变量
+	*/
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
@@ -242,7 +258,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 	}
 
+	// 🤦‍♂️ 下面分 4 步来 决策 thinkingLevel, 这些代码抽离成一个函数来封装更合适
+
+	// 1. 用调用者指定的（最高优先级）
 	let thinkingLevel = options.thinkingLevel;
+
+	// 2. 正在恢复已有会话?
+	// 会话里有 thinking_level_change？  → 用会话保存的级别
+	// 没有？ → 用设置里默认的级别（如果有的话）
 
 	// If session has data, restore thinking level from it
 	if (thinkingLevel === undefined && hasExistingSession) {
@@ -251,10 +274,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
 	}
 
+	// 3. 全新会话且调用者没指定？ → 用 settings 默认值
+
 	// Fall back to settings default
 	if (thinkingLevel === undefined) {
 		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 	}
+
+	// 4. 最后兜底：模型不支持 reasoning？      → 强制 "off"
 
 	// Clamp to model capabilities
 	if (!model || !model.reasoning) {
@@ -270,6 +297,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: defaultActiveToolNames;
 
 	let agent: Agent;
+
+	/*
+	    👇 这是个安全/隐私功能，注释写了 "defense-in-depth"（纵深防御）。
+
+		为什么需要屏蔽图片？
+
+		图片发给 LLM 意味着图片数据会上传到 API provider 的服务器。有些场景用户不想这么做：
+			- 截图里可能包含敏感信息（密码、内部系统界面、客户数据）
+			- 公司安全策略禁止向外部 API 发送图片
+			- 某些模型处理图片的成本高，用户想省钱
+
+		所以 settings 里有个 blockImages 开关（默认 false），用户可以在 TUI 的 /settings 里打开。
+
+		为什么在 convertToLlm 这层做？
+
+		注释说 defense-in-depth：图片可能从多个入口进来（用户粘贴、工具返回截图、extension注入），在消息发给LLM 的最后一道关卡统一过滤，比在每个入口分别拦截更可靠。
+
+		用户粘贴图片 ─┐
+		工具返回截图 ──┤──→ AgentMessage[] ──→ convertToLlmWithBlockImages() ──→ LLM
+		extension注入图片 ──┘                        ↑ 这里统一拦截，不会遗漏
+
+		图片被替换成文字 "Image reading is disabled."，而不是静默丢弃——让 LLM知道"有图片但我看不到"，避免它困惑为什么缺少上下文。
+	*/
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -291,6 +341,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							)
 							.filter(
 								(c, i, arr) =>
+									// 这是去重：如果连续多张图片被替换，避免出现重复的占位文字。
 									// Dedupe consecutive "Image reading is disabled." texts
 									!(
 										c.type === "text" &&
@@ -308,6 +359,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 	};
 
+	// extensionRunnerRef 用 ref 对象（{ current?: ExtensionRunner }）是因为 Agent 先创建，ExtensionRunner 后创建，ref 让两者能延迟绑定。
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
 	agent = new Agent({
@@ -317,6 +369,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			tools: [],
 		},
+		// See packages/agent/src/types.ts
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
 			const auth = await modelRegistry.getApiKeyAndHeaders(model);
